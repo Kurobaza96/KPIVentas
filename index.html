@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Libro de Ventas · Panel conectado a Sheets</title>
+<title>Libro de Ventas · Dashboard Google Sheets v2</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Public+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -240,7 +240,7 @@
   <!-- ============ SETUP ============ -->
   <section id="setupCard" class="setup-card">
     <h2>Conectá tu hoja de cálculo</h2>
-    <p class="help">Pegá el link de tu Google Sheet. El panel lee los datos directamente desde tu navegador — no se envían ni guardan en ningún servidor.</p>
+    <p class="help">Pegá el link de tu Google Sheet. El panel intenta leer los datos directamente desde tu navegador. No se guardan los datos de ventas en este HTML.</p>
 
     <div class="field">
       <label for="sheetInput">Link o ID de la hoja de Google Sheets</label>
@@ -257,6 +257,11 @@
 
     <button class="btn-primary" id="connectBtn" type="button">Conectar y traer datos</button>
     <div class="error-box" id="setupError"></div>
+    <div id="connectionHint" style="margin-top:12px;color:var(--ink-soft);font-size:12px;line-height:1.5;">
+      <strong>Importante:</strong> si abrís este archivo directamente como <code>file://</code>,
+      algunos navegadores pueden bloquear las consultas a Google Sheets. En ese caso usá un servidor local
+      (por ejemplo Live Server) o alojá el HTML en una página web.
+    </div>
 
     <details class="howto">
       <summary>¿Cómo comparto mi hoja correctamente?</summary>
@@ -377,8 +382,50 @@
   }
 
   function buildGvizUrl(id, tabName){
-    const base = `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:json`;
-    return tabName ? `${base}&sheet=${encodeURIComponent(tabName)}` : `${base}&gid=0`;
+    const base = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(id)}/gviz/tq`;
+    const params = new URLSearchParams();
+    params.set('tqx', 'out:json');
+    // No forcemos gid=0: si no se indica pestaña, Google usa la hoja predeterminada.
+    if(tabName) params.set('sheet', tabName);
+    return `${base}?${params.toString()}`;
+  }
+
+  function buildCsvUrl(id, tabName){
+    const base = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(id)}/gviz/tq`;
+    const params = new URLSearchParams();
+    params.set('tqx', 'out:csv');
+    if(tabName) params.set('sheet', tabName);
+    return `${base}?${params.toString()}`;
+  }
+
+  function parseGvizResponse(text){
+    // Respuesta normal: google.visualization.Query.setResponse({...});
+    const match = text.match(/google\.visualization\.Query\.setResponse\(([\s\S]*)\)\s*;?\s*$/);
+    if(!match) return null;
+    try { return JSON.parse(match[1]); } catch(e) { return null; }
+  }
+
+  function parseCsvLine(line){
+    const out = [];
+    let cur = '', quoted = false;
+    for(let i=0; i<line.length; i++){
+      const ch = line[i];
+      if(ch === '"'){
+        if(quoted && line[i+1] === '"'){ cur += '"'; i++; }
+        else quoted = !quoted;
+      }else if(ch === ',' && !quoted){
+        out.push(cur); cur = '';
+      }else{
+        cur += ch;
+      }
+    }
+    out.push(cur);
+    return out;
+  }
+
+  function parseCsv(text){
+    const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).filter(line => line.trim() !== '');
+    return lines.map(parseCsvLine);
   }
 
   function parseGvizDate(v){
@@ -419,10 +466,36 @@
 
   function parseNumber(raw){
     if(typeof raw === 'number') return raw;
-    if(raw == null) return NaN;
-    const cleaned = String(raw).replace(/[^\d.,-]/g,'').replace(/\.(?=.*\.)/g,'').replace(',', '.');
-    const n = parseFloat(cleaned);
-    return isNaN(n) ? NaN : n;
+    if(raw == null || raw === '') return NaN;
+
+    let s = String(raw).trim();
+    s = s.replace(/[^\d.,\-+]/g,'');
+
+    const lastComma = s.lastIndexOf(',');
+    const lastDot = s.lastIndexOf('.');
+
+    // Si existen ambos separadores, el último suele ser el decimal.
+    if(lastComma !== -1 && lastDot !== -1){
+      if(lastComma > lastDot){
+        s = s.replace(/\./g,'').replace(',', '.');
+      }else{
+        s = s.replace(/,/g,'');
+      }
+    }else if(lastComma !== -1){
+      // 1,25 = decimal; 1,250 = miles (si hay exactamente 3 dígitos después).
+      const decimals = s.length - lastComma - 1;
+      s = decimals === 3 && lastComma > 0
+        ? s.replace(/,/g,'')
+        : s.replace(',', '.');
+    }else if(lastDot !== -1){
+      const decimals = s.length - lastDot - 1;
+      if(decimals === 3 && (s.match(/\./g)||[]).length === 1){
+        s = s.replace(/\./g,'');
+      }
+    }
+
+    const n = Number(s);
+    return Number.isFinite(n) ? n : NaN;
   }
 
   function fmtMoney(n){
@@ -449,38 +522,78 @@
   // ---------- fetch & parse ----------
   async function fetchSheet(id, tabName){
     const url = buildGvizUrl(id, tabName);
-    let res;
+
+    // Primero intentamos Gviz JSON. Esto funciona cuando la hoja permite lectura
+    // desde el navegador y nos da tipos de datos útiles para fechas/números.
     try{
-      res = await fetch(url);
+      const res = await fetch(url, {
+        method:'GET',
+        mode:'cors',
+        cache:'no-store'
+      });
+
+      if(!res.ok){
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const text = await res.text();
+      const data = parseGvizResponse(text);
+
+      if(data){
+        if(data.status === 'error'){
+          const reason = (data.errors && data.errors[0] &&
+            (data.errors[0].detailed_message || data.errors[0].message)) ||
+            'Google Sheets rechazó la consulta.';
+          throw new Error(reason);
+        }
+
+        const table = data.table;
+        if(!table || !table.cols || !table.cols.length){
+          throw new Error('La hoja está vacía o no tiene columnas.');
+        }
+
+        const headers = table.cols.map((c,i) =>
+          (c.label && c.label.trim()) || ('Columna ' + (i+1))
+        );
+
+        const rows = (table.rows || []).map(r =>
+          (r.c || []).map(cell =>
+            cell ? (cell.v !== undefined ? cell.v : cell.f) : null
+          )
+        );
+
+        if(!rows.length){
+          throw new Error('La hoja está vacía o no tiene filas debajo del encabezado.');
+        }
+
+        return { headers, rows };
+      }
+
+      // Algunas respuestas no tienen el wrapper esperado. Si llegamos aquí,
+      // damos un mensaje útil en lugar del error genérico.
+      if(/Sign in|Iniciar sesión|Access denied|Permission denied/i.test(text)){
+        throw new Error('Google Sheets está solicitando acceso. Verificá que la hoja esté compartida como "Cualquiera con el enlace → Lector".');
+      }
+
+      throw new Error('Google no devolvió datos de la hoja en el formato esperado.');
     }catch(e){
-      throw new Error('No se pudo conectar con la hoja. Revisá tu conexión a internet o que el link sea correcto.');
+      const message = String(e && e.message || e);
+
+      // Los errores de CORS suelen aparecer como "Failed to fetch".
+      if(/Failed to fetch|NetworkError|CORS|Load failed/i.test(message)){
+        throw new Error(
+          'El navegador bloqueó la conexión directa con Google Sheets. ' +
+          'Si abrís este HTML como archivo local (file://), ejecutalo mediante un servidor local ' +
+          '(por ejemplo VS Code Live Server) o alojalo en una página web. ' +
+          'Además, confirmá que la hoja esté compartida como "Cualquiera con el enlace → Lector".'
+        );
+      }
+
+      throw new Error(
+        'No se pudo leer Google Sheets: ' + message +
+        ' Verificá que el ID/link sea correcto y que la hoja tenga acceso de lectura.'
+      );
     }
-    if(!res.ok){
-      throw new Error('No se pudo leer la hoja (error ' + res.status + '). Confirmá que esté compartida como "Cualquiera con el enlace puede ver".');
-    }
-    const text = await res.text();
-    const match = text.match(/google\.visualization\.Query\.setResponse\(([\s\S]*)\)\s*;?\s*$/);
-    if(!match){
-      throw new Error('No se pudo leer la hoja. Confirmá que el link sea correcto y que esté compartida como "Cualquiera con el enlace puede ver".');
-    }
-    let data;
-    try{ data = JSON.parse(match[1]); }catch(e){
-      throw new Error('La respuesta de Google Sheets no tiene el formato esperado. Probá de nuevo en unos segundos.');
-    }
-    if(data.status === 'error'){
-      const reason = (data.errors && data.errors[0] && data.errors[0].detailed_message) || 'Verificá el nombre exacto de la pestaña.';
-      throw new Error('No se encontró la pestaña indicada. ' + reason);
-    }
-    const table = data.table;
-    if(!table || !table.cols || !table.cols.length){
-      throw new Error('La hoja está vacía o no tiene columnas.');
-    }
-    const headers = table.cols.map((c,i) => (c.label && c.label.trim()) || ('Columna ' + (i+1)));
-    const rows = (table.rows||[]).map(r => (r.c||[]).map(cell => cell ? (cell.v !== undefined ? cell.v : cell.f) : null));
-    if(!rows.length){
-      throw new Error('La hoja está vacía o no tiene filas debajo del encabezado.');
-    }
-    return { headers, rows };
   }
 
   // ---------- column auto-detect ----------
@@ -583,7 +696,12 @@
     const today = new Date();
     const fromInput = document.getElementById('dateFrom');
     const toInput = document.getElementById('dateTo');
-    function toISO(d){ return d.toISOString().slice(0,10); }
+    function toISO(d){
+      const y = d.getFullYear();
+      const m = String(d.getMonth()+1).padStart(2,'0');
+      const day = String(d.getDate()).padStart(2,'0');
+      return `${y}-${m}-${day}`;
+    }
     if(preset === 'all'){
       fromInput.value = ''; toInput.value = '';
     } else if(preset === '7' || preset === '30'){
@@ -602,18 +720,41 @@
     const total = FILTERED.reduce((s,r) => s + r.amount, 0);
     const count = FILTERED.length;
     const avg = count ? total / count : 0;
+    const hasQty = CONFIG.columnMap.qty >= 0;
     const byProduct = new Map();
-    FILTERED.forEach(r => byProduct.set(r.product, (byProduct.get(r.product)||0) + r.amount));
-    let topProduct = '—', topVal = 0;
-    byProduct.forEach((v,k) => { if(v > topVal){ topVal = v; topProduct = k; } });
+
+    FILTERED.forEach(r => {
+      const key = r.product;
+      const current = byProduct.get(key) || { amount:0, qty:0 };
+      current.amount += r.amount;
+      current.qty += hasQty && r.qty != null ? r.qty : 0;
+      byProduct.set(key, current);
+    });
+
+    let topProduct = '—', topVal = 0, topRevenue = 0;
+    byProduct.forEach((v,k) => {
+      const metric = hasQty ? v.qty : v.amount;
+      if(metric > topVal){
+        topVal = metric;
+        topProduct = k;
+        topRevenue = v.amount;
+      }
+    });
 
     const cards = [
       { label:'Total vendido', val: total, fmt:'money' },
       { label:'Ticket promedio', val: avg, fmt:'money' },
-      { label:'N° de ventas', val: count, fmt:'number' },
-      { label:'Producto más vendido', val: topProduct, fmt:'text', sub: topVal ? fmtMoney(topVal) : '' }
+      { label:'N° de registros', val: count, fmt:'number' },
+      {
+        label: hasQty ? 'Producto más vendido' : 'Producto con mayor facturación',
+        val: topProduct,
+        fmt:'text',
+        sub: hasQty
+          ? `${fmtNumber(topVal)} unidades · ${fmtMoney(topRevenue)}`
+          : (topRevenue ? fmtMoney(topRevenue) : '')
+      }
     ];
-    const hasQty = CONFIG.columnMap.qty >= 0;
+
     if(hasQty){
       const units = FILTERED.reduce((s,r) => s + (r.qty||0), 0);
       cards.push({ label:'Unidades vendidas', val: units, fmt:'number' });
@@ -936,6 +1077,7 @@
     document.getElementById('setupCard').classList.remove('hidden');
     document.getElementById('sheetInput').value = CONFIG.sheetId || '';
     document.getElementById('tabInput').value = CONFIG.tabName || '';
+    document.getElementById('currencyInput').value = CONFIG.currency || 'Q';
   });
 
   document.getElementById('applyMappingBtn').addEventListener('click', () => {
