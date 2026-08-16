@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Libro de Ventas · Dashboard Google Sheets v2</title>
+<title>Dashboard de Ventas · Pedidos y Mesas</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Public+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -200,6 +200,24 @@
   td.num, th.num{text-align:right; font-family:'IBM Plex Mono',monospace; font-variant-numeric:tabular-nums;}
   .table-note{font-size:12px; color:var(--ink-soft); margin-top:12px; font-family:'IBM Plex Mono',monospace;}
   .table-scroll{overflow-x:auto;}
+  .date-main{font-weight:600;white-space:nowrap;}
+  .date-time{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink-soft);margin-top:2px;}
+  .table-badge,.category-badge{
+    display:inline-flex;align-items:center;justify-content:center;
+    border:1px solid var(--rule);border-radius:14px;padding:4px 9px;
+    font-family:'IBM Plex Mono',monospace;font-size:11px;white-space:nowrap;
+  }
+  .category-badge{background:var(--paper-deep);font-family:'Public Sans',sans-serif;}
+  .client-name{font-weight:600;min-width:120px;}
+  .order-cell{min-width:230px;line-height:1.45;}
+  .order-item{display:flex;gap:7px;align-items:baseline;margin:2px 0;}
+  .order-item strong{
+    color:var(--green-deep);font-family:'IBM Plex Mono',monospace;
+    min-width:28px;
+  }
+  .total-cell{font-weight:700;white-space:nowrap;}
+  tbody tr{transition:background .12s ease;}
+
 
   footer{margin-top:34px; font-size:12px; color:var(--ink-soft); text-align:center; line-height:1.7;}
 
@@ -240,7 +258,7 @@
   <!-- ============ SETUP ============ -->
   <section id="setupCard" class="setup-card">
     <h2>Conectá tu hoja de cálculo</h2>
-    <p class="help">Pegá el link de tu Google Sheet. El panel intenta leer los datos directamente desde tu navegador. No se guardan los datos de ventas en este HTML.</p>
+    <p class="help">Pegá el link de tu Google Sheet. El dashboard está optimizado para tu estructura: Fecha/Hora · Mesa · Cliente · Categoría · Pedido · Total.</p>
 
     <div class="field">
       <label for="sheetInput">Link o ID de la hoja de Google Sheets</label>
@@ -308,8 +326,8 @@
         <button class="chip active" data-preset="all" type="button">Todo</button>
       </div>
       <div class="field search-field">
-        <label for="searchInput">Buscar producto</label>
-        <input type="text" id="searchInput" placeholder="Ej: camisa azul">
+        <label for="searchInput">Buscar</label>
+        <input type="text" id="searchInput" placeholder="Producto, cliente o mesa...">
       </div>
     </div>
 
@@ -328,7 +346,7 @@
         <div class="empty-note hidden" id="groupEmpty">Sin datos para este rango.</div>
       </div>
       <div class="chart-block">
-        <h3>Top 5 productos</h3>
+        <h3>Productos más vendidos</h3>
         <div class="chart-canvas-wrap"><canvas id="topChart"></canvas></div>
         <div class="empty-note hidden" id="topEmpty">Sin datos para este rango.</div>
       </div>
@@ -336,7 +354,7 @@
 
     <div class="table-block">
       <div class="table-head-row">
-        <h3>Detalle de ventas</h3>
+        <h3>Pedidos registrados</h3>
         <span class="table-note" id="tableCount"></span>
       </div>
       <div class="table-scroll">
@@ -345,12 +363,16 @@
           <tbody id="tableBody"></tbody>
         </table>
       </div>
-      <div class="empty-note hidden" id="tableEmpty">No hay filas que coincidan con el filtro.</div>
+      <div class="empty-note hidden" id="tableEmpty">No hay pedidos que coincidan con el filtro.</div>
+      <div class="table-note" style="margin-top:14px;">
+        El pedido se desglosa automáticamente desde el formato <strong>cantidad × producto</strong>.
+        Las estadísticas de productos se calculan por unidades, mientras que los totales y categorías se calculan por pedido.
+      </div>
     </div>
   </div>
 
   <footer>
-    Los datos se leen directamente de tu navegador a Google Sheets — no pasan por ningún otro servidor.<br>
+    Los datos se leen desde Google Sheets y se procesan en el navegador — no se almacenan en este dashboard.<br>
     Tip: usá "🔗 Copiar enlace directo" en Ajustes para volver sin tener que pegar el link de nuevo.
   </footer>
 </div>
@@ -362,10 +384,18 @@
   const COLORS = { green:'#2F6F4E', greenDeep:'#1F4D36', red:'#A63A2E', gold:'#C9932B', ink:'#1C2B22', inkSoft:'#54655A', ruleSoft:'#DAE3D5', white:'#FBFCF9' };
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  let CONFIG = { sheetId:null, tabName:null, currency:'Q', columnMap:{ date:-1, product:-1, amount:-1, category:-1, qty:-1 } };
+  let CONFIG = {
+    sheetId:null,
+    tabName:null,
+    currency:'Q',
+    columnMap:{
+      date:-1, table:-1, client:-1, category:-1, product:-1, amount:-1
+    }
+  };
   let RAW = { headers:[], rows:[] };       // raw parsed sheet
-  let ALL = [];                            // normalized rows {date, product, amount, category, qty}
+  let ALL = [];                            // normalized orders
   let FILTERED = [];
+  let PRODUCT_LINES = [];                  // expanded product lines from orders
   let sortState = { key:'date', dir:'desc' };
   let charts = { trend:null, group:null, top:null };
 
@@ -598,54 +628,82 @@
 
   // ---------- column auto-detect ----------
   const KEYWORDS = {
-    date: ['fecha','date','dia'],
-    product: ['producto','product','articulo','item','descripcion','nombre'],
-    amount: ['monto','total','venta','ventas','importe','precio','amount','ingreso','revenue','subtotal'],
+    date: ['fecha','hora','date','datetime'],
+    table: ['mesa','table'],
+    client: ['cliente','nombre','customer'],
     category: ['categoria','category','rubro','tipo','linea','familia'],
-    qty: ['cantidad','unidades','qty','quantity','cant']
+    product: ['pedido','producto','product','articulo','item','descripcion'],
+    amount: ['total','monto','venta','ventas','importe','amount','ingreso','revenue']
   };
   function autoDetect(headers){
-    const map = { date:-1, product:-1, amount:-1, category:-1, qty:-1 };
+    const map = {
+      date:-1, table:-1, client:-1, category:-1, product:-1, amount:-1
+    };
     const normed = headers.map(norm);
+
     Object.keys(KEYWORDS).forEach(role => {
       for(const kw of KEYWORDS[role]){
         const idx = normed.findIndex(h => h.includes(kw));
-        if(idx !== -1 && !Object.values(map).includes(idx)){ map[role] = idx; break; }
+        if(idx !== -1 && !Object.values(map).includes(idx)){
+          map[role] = idx;
+          break;
+        }
       }
     });
+
+    // Fallback for the exact six-column structure supplied by the user.
+    const expected = ['date','table','client','category','product','amount'];
+    expected.forEach((role,i) => {
+      if(map[role] === -1 && i < headers.length &&
+         !Object.values(map).includes(i)){
+        map[role] = i;
+      }
+    });
+
     return map;
   }
 
   function renderMappingUI(){
     const grid = document.getElementById('mappingGrid');
     grid.innerHTML = '';
+
     const roles = [
-      { key:'date', label:'Fecha *', required:true },
-      { key:'product', label:'Producto *', required:true },
-      { key:'amount', label:'Monto / Total *', required:true },
+      { key:'date', label:'Fecha y hora *', required:true },
+      { key:'table', label:'Mesa', required:false },
+      { key:'client', label:'Cliente', required:false },
       { key:'category', label:'Categoría', required:false },
-      { key:'qty', label:'Cantidad', required:false }
+      { key:'product', label:'Pedido *', required:true },
+      { key:'amount', label:'Total *', required:true }
     ];
+
     roles.forEach(role => {
       const field = document.createElement('div');
       field.className = 'field';
+
       const label = document.createElement('label');
       label.textContent = role.label;
       label.setAttribute('for', 'map_'+role.key);
+
       const select = document.createElement('select');
       select.id = 'map_'+role.key;
+
       if(!role.required){
         const opt = document.createElement('option');
-        opt.value = '-1'; opt.textContent = '— Ninguna —';
+        opt.value = '-1';
+        opt.textContent = '— Ninguna —';
         select.appendChild(opt);
       }
+
       RAW.headers.forEach((h,i) => {
         const opt = document.createElement('option');
-        opt.value = i; opt.textContent = h;
+        opt.value = i;
+        opt.textContent = h;
         if(CONFIG.columnMap[role.key] === i) opt.selected = true;
         select.appendChild(opt);
       });
-      field.appendChild(label); field.appendChild(select);
+
+      field.appendChild(label);
+      field.appendChild(select);
       grid.appendChild(field);
     });
   }
@@ -653,11 +711,73 @@
   function readMappingUI(){
     return {
       date: +document.getElementById('map_date').value,
-      product: +document.getElementById('map_product').value,
-      amount: +document.getElementById('map_amount').value,
+      table: +document.getElementById('map_table').value,
+      client: +document.getElementById('map_client').value,
       category: +document.getElementById('map_category').value,
-      qty: +document.getElementById('map_qty').value
+      product: +document.getElementById('map_product').value,
+      amount: +document.getElementById('map_amount').value
     };
+  }
+
+
+  // ---------- restaurant order parsing ----------
+  // Expected order cell examples:
+  // "2X Hamburguesa, 1X Coca Cola"
+  // "2 X Hamburguesa, 1 x Coca Cola"
+  function parseOrderItems(raw){
+    if(raw == null || String(raw).trim() === '') return [];
+
+    const text = String(raw).trim();
+    const parts = text.split(/\s*,\s*/);
+    const items = [];
+
+    parts.forEach(part => {
+      const cleaned = part.trim();
+      if(!cleaned) return;
+
+      const m = cleaned.match(/^\s*(\d+(?:[.,]\d+)?)\s*[xX×]\s*(.+?)\s*$/);
+      if(m){
+        const qty = parseNumber(m[1]);
+        const product = m[2].trim();
+        if(product) items.push({ qty:Number.isFinite(qty) ? qty : 1, product });
+      }else{
+        // Fallback: if an item doesn't follow "cantidad X producto",
+        // keep the text instead of losing the sale.
+        items.push({ qty:1, product:cleaned });
+      }
+    });
+
+    return items;
+  }
+
+  function buildExpandedProductLines(){
+    PRODUCT_LINES = [];
+    FILTERED.forEach(order => {
+      order.items.forEach(item => {
+        PRODUCT_LINES.push({
+          date: order.date,
+          table: order.table,
+          client: order.client,
+          category: order.category,
+          product: item.product,
+          qty: item.qty,
+          amount: order.items.length === 1
+            ? order.amount
+            : 0,
+          orderAmount: order.amount
+        });
+      });
+    });
+  }
+
+  function orderSearchText(order){
+    return [
+      order.productText,
+      order.client,
+      order.table,
+      order.category,
+      order.items.map(i => i.product).join(' ')
+    ].filter(Boolean).join(' ');
   }
 
   // ---------- normalize rows ----------
@@ -665,29 +785,55 @@
     const map = CONFIG.columnMap;
     ALL = [];
     let skipped = 0;
-    RAW.rows.forEach(r => {
+
+    RAW.rows.forEach((r, index) => {
       const date = parseFlexibleDate(r[map.date]);
-      const product = map.product >= 0 ? String(r[map.product] ?? '').trim() : '';
+      const table = map.table >= 0 ? String(r[map.table] ?? '').trim() : '';
+      const client = map.client >= 0 ? String(r[map.client] ?? '').trim() : '';
+      const category = map.category >= 0 ? String(r[map.category] ?? '').trim() : '';
+      const productText = map.product >= 0 ? String(r[map.product] ?? '').trim() : '';
       const amount = map.amount >= 0 ? parseNumber(r[map.amount]) : NaN;
-      const category = map.category >= 0 ? String(r[map.category] ?? '').trim() : null;
-      const qty = map.qty >= 0 ? parseNumber(r[map.qty]) : null;
-      if(!product || isNaN(amount) || !date){ skipped++; return; }
-      ALL.push({ date, product, amount, category: category || null, qty: isNaN(qty) ? null : qty });
+      const items = parseOrderItems(productText);
+
+      if(!date || !items.length || isNaN(amount)){
+        skipped++;
+        return;
+      }
+
+      const totalUnits = items.reduce((s,item) => s + (item.qty || 0), 0);
+
+      ALL.push({
+        id: index + 1,
+        date,
+        table: table || '—',
+        client: client || 'Cliente no indicado',
+        category: category || 'Sin categoría',
+        productText,
+        items,
+        amount,
+        qty: totalUnits
+      });
     });
+
     return skipped;
   }
 
   // ---------- filtering ----------
   function applyFilters(){
-    const from = document.getElementById('dateFrom').value ? new Date(document.getElementById('dateFrom').value+'T00:00:00') : null;
-    const to = document.getElementById('dateTo').value ? new Date(document.getElementById('dateTo').value+'T23:59:59') : null;
+    const from = document.getElementById('dateFrom').value
+      ? new Date(document.getElementById('dateFrom').value+'T00:00:00') : null;
+    const to = document.getElementById('dateTo').value
+      ? new Date(document.getElementById('dateTo').value+'T23:59:59') : null;
     const q = norm(document.getElementById('searchInput').value);
+
     FILTERED = ALL.filter(row => {
       if(from && row.date < from) return false;
       if(to && row.date > to) return false;
-      if(q && !norm(row.product).includes(q) && !(row.category && norm(row.category).includes(q))) return false;
+      if(q && !norm(orderSearchText(row)).includes(q)) return false;
       return true;
     });
+
+    buildExpandedProductLines();
     renderAll();
   }
 
@@ -718,51 +864,44 @@
   // ---------- KPI render ----------
   function renderKPIs(){
     const total = FILTERED.reduce((s,r) => s + r.amount, 0);
-    const count = FILTERED.length;
-    const avg = count ? total / count : 0;
-    const hasQty = CONFIG.columnMap.qty >= 0;
-    const byProduct = new Map();
+    const orders = FILTERED.length;
+    const avg = orders ? total / orders : 0;
+    const units = FILTERED.reduce((s,r) => s + r.qty, 0);
 
-    FILTERED.forEach(r => {
-      const key = r.product;
-      const current = byProduct.get(key) || { amount:0, qty:0 };
-      current.amount += r.amount;
-      current.qty += hasQty && r.qty != null ? r.qty : 0;
-      byProduct.set(key, current);
+    const byProduct = new Map();
+    PRODUCT_LINES.forEach(item => {
+      byProduct.set(item.product, (byProduct.get(item.product)||0) + item.qty);
     });
 
-    let topProduct = '—', topVal = 0, topRevenue = 0;
+    let topProduct = '—', topUnits = 0;
     byProduct.forEach((v,k) => {
-      const metric = hasQty ? v.qty : v.amount;
-      if(metric > topVal){
-        topVal = metric;
+      if(v > topUnits){
+        topUnits = v;
         topProduct = k;
-        topRevenue = v.amount;
+      }
+    });
+
+    const byTable = new Map();
+    FILTERED.forEach(r => byTable.set(r.table, (byTable.get(r.table)||0) + r.amount));
+    let topTable = '—', topTableValue = 0;
+    byTable.forEach((v,k) => {
+      if(v > topTableValue){
+        topTableValue = v;
+        topTable = k;
       }
     });
 
     const cards = [
-      { label:'Total vendido', val: total, fmt:'money' },
-      { label:'Ticket promedio', val: avg, fmt:'money' },
-      { label:'N° de registros', val: count, fmt:'number' },
-      {
-        label: hasQty ? 'Producto más vendido' : 'Producto con mayor facturación',
-        val: topProduct,
-        fmt:'text',
-        sub: hasQty
-          ? `${fmtNumber(topVal)} unidades · ${fmtMoney(topRevenue)}`
-          : (topRevenue ? fmtMoney(topRevenue) : '')
-      }
+      { label:'Ventas totales', val: total, fmt:'money', sub:`${fmtNumber(orders)} pedidos` },
+      { label:'Ticket promedio', val: avg, fmt:'money', sub:'Por pedido' },
+      { label:'Pedidos', val: orders, fmt:'number', sub:'Órdenes registradas' },
+      { label:'Unidades', val: units, fmt:'number', sub:'Productos vendidos' },
+      { label:'Más vendido', val: topProduct, fmt:'text', sub: topUnits ? `${fmtNumber(topUnits)} unidades` : '' },
+      { label:'Mesa con mayor venta', val: topTable, fmt:'text', sub: topTableValue ? fmtMoney(topTableValue) : '' }
     ];
 
-    if(hasQty){
-      const units = FILTERED.reduce((s,r) => s + (r.qty||0), 0);
-      cards.push({ label:'Unidades vendidas', val: units, fmt:'number' });
-    }
-
     const row = document.getElementById('kpiRow');
-    const firstRender = row.children.length !== cards.length;
-    if(firstRender) row.innerHTML = '';
+    if(row.children.length !== cards.length) row.innerHTML = '';
 
     cards.forEach((c, i) => {
       let card = row.children[i];
@@ -772,26 +911,49 @@
         card.innerHTML = `<div class="lbl"></div><div class="val"></div><div class="sub"></div>`;
         row.appendChild(card);
       }
+
       card.querySelector('.lbl').textContent = c.label;
       const valEl = card.querySelector('.val');
       const subEl = card.querySelector('.sub');
       subEl.textContent = c.sub || '';
+
       if(c.fmt === 'text'){
         valEl.textContent = c.val;
-      } else {
+      }else{
         valEl.dataset.fmt = c.fmt;
-        animateValue(valEl, c.fmt === 'money' ? fmtMoney(c.val) : fmtNumber(c.val), true, c.val);
+        animateValue(
+          valEl,
+          c.fmt === 'money' ? fmtMoney(c.val) : fmtNumber(c.val),
+          true,
+          c.val
+        );
       }
-      card.classList.remove('pulse'); void card.offsetWidth; card.classList.add('pulse');
+
+      card.classList.remove('pulse');
+      void card.offsetWidth;
+      card.classList.add('pulse');
     });
   }
 
   // ---------- aggregation ----------
-  function groupSum(rows, keyFn){
+  function groupSum(rows, keyFn, valueFn = r => r.amount){
     const map = new Map();
-    rows.forEach(r => { const k = keyFn(r); if(k == null) return; map.set(k, (map.get(k)||0) + r.amount); });
+    rows.forEach(r => {
+      const k = keyFn(r);
+      if(k == null || k === '') return;
+      map.set(k, (map.get(k)||0) + valueFn(r));
+    });
     return map;
   }
+
+  function productUnitsMap(){
+    const map = new Map();
+    PRODUCT_LINES.forEach(item => {
+      map.set(item.product, (map.get(item.product)||0) + item.qty);
+    });
+    return map;
+  }
+
 
   function bucketLabel(date, byMonth){
     return byMonth
@@ -848,30 +1010,58 @@
     const emptyNote = document.getElementById('groupEmpty');
     const title = document.getElementById('groupChartTitle');
     destroyChart('group');
-    if(!FILTERED.length){ wrap.classList.add('hidden'); emptyNote.classList.remove('hidden'); return; }
-    wrap.classList.remove('hidden'); emptyNote.classList.add('hidden');
 
-    const hasCategory = CONFIG.columnMap.category >= 0;
-    title.textContent = hasCategory ? 'Ventas por categoría' : 'Ventas por producto';
-    const map = hasCategory
-      ? groupSum(FILTERED, r => r.category || 'Sin categoría')
-      : groupSum(FILTERED, r => r.product);
-    let entries = [...map.entries()].sort((a,b) => b[1]-a[1]);
-    if(!hasCategory && entries.length > 8){
-      const top = entries.slice(0,7);
-      const restSum = entries.slice(7).reduce((s,e)=>s+e[1],0);
-      entries = [...top, ['Otros', restSum]];
+    if(!FILTERED.length){
+      wrap.classList.add('hidden');
+      emptyNote.classList.remove('hidden');
+      return;
     }
+
+    wrap.classList.remove('hidden');
+    emptyNote.classList.add('hidden');
+
+    title.textContent = 'Ventas por categoría';
+
+    const map = groupSum(
+      FILTERED,
+      r => r.category || 'Sin categoría',
+      r => r.amount
+    );
+
+    const entries = [...map.entries()].sort((a,b) => b[1]-a[1]).slice(0,10);
     const ctx = document.getElementById('groupChart').getContext('2d');
+
     charts.group = new Chart(ctx, {
       type:'bar',
-      data:{ labels: entries.map(e=>e[0]), datasets:[{ data: entries.map(e=>e[1]), backgroundColor: COLORS.green, hoverBackgroundColor: COLORS.gold, borderRadius:2, maxBarThickness:38 }]},
+      data:{
+        labels: entries.map(e=>e[0]),
+        datasets:[{
+          data: entries.map(e=>e[1]),
+          backgroundColor: COLORS.green,
+          hoverBackgroundColor: COLORS.gold,
+          borderRadius:2,
+          maxBarThickness:38
+        }]
+      },
       options:{
-        responsive:true, maintainAspectRatio:false,
-        plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label: c => fmtMoney(c.parsed.y) } } },
+        responsive:true,
+        maintainAspectRatio:false,
+        plugins:{
+          legend:{display:false},
+          tooltip:{ callbacks:{ label: c => fmtMoney(c.parsed.y) } }
+        },
         scales:{
-          y:{ ticks:{ callback:v => CONFIG.currency+' '+fmtNumber(v), font:{family:"'IBM Plex Mono'",size:10} }, grid:{color: COLORS.ruleSoft} },
-          x:{ ticks:{ font:{size:10} }, grid:{display:false} }
+          y:{
+            ticks:{
+              callback:v => CONFIG.currency+' '+fmtNumber(v),
+              font:{family:"'IBM Plex Mono'",size:10}
+            },
+            grid:{color: COLORS.ruleSoft}
+          },
+          x:{
+            ticks:{font:{size:10}},
+            grid:{display:false}
+          }
         }
       }
     });
@@ -881,96 +1071,190 @@
     const wrap = document.getElementById('topChart').parentElement;
     const emptyNote = document.getElementById('topEmpty');
     destroyChart('top');
-    if(!FILTERED.length){ wrap.classList.add('hidden'); emptyNote.classList.remove('hidden'); return; }
-    wrap.classList.remove('hidden'); emptyNote.classList.add('hidden');
 
-    const map = groupSum(FILTERED, r => r.product);
-    const entries = [...map.entries()].sort((a,b) => a[1]-b[1]).slice(-5); // ascending so top ends at top of h-bar
+    if(!PRODUCT_LINES.length){
+      wrap.classList.add('hidden');
+      emptyNote.classList.remove('hidden');
+      return;
+    }
+
+    wrap.classList.remove('hidden');
+    emptyNote.classList.add('hidden');
+
+    const map = productUnitsMap();
+    const entries = [...map.entries()]
+      .sort((a,b) => a[1]-b[1])
+      .slice(-7);
+
     const ctx = document.getElementById('topChart').getContext('2d');
+
     charts.top = new Chart(ctx, {
       type:'bar',
-      data:{ labels: entries.map(e=>e[0]), datasets:[{ data: entries.map(e=>e[1]), backgroundColor: COLORS.gold, hoverBackgroundColor: COLORS.greenDeep, borderRadius:2, maxBarThickness:26 }]},
+      data:{
+        labels: entries.map(e=>e[0]),
+        datasets:[{
+          data: entries.map(e=>e[1]),
+          backgroundColor: COLORS.gold,
+          hoverBackgroundColor: COLORS.greenDeep,
+          borderRadius:2,
+          maxBarThickness:28
+        }]
+      },
       options:{
-        indexAxis:'y', responsive:true, maintainAspectRatio:false,
-        plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label: c => fmtMoney(c.parsed.x) } } },
+        indexAxis:'y',
+        responsive:true,
+        maintainAspectRatio:false,
+        plugins:{
+          legend:{display:false},
+          tooltip:{
+            callbacks:{
+              label: c => `${fmtNumber(c.parsed.x)} unidades`
+            }
+          }
+        },
         scales:{
-          x:{ ticks:{ callback:v => CONFIG.currency+' '+fmtNumber(v), font:{family:"'IBM Plex Mono'",size:10} }, grid:{color: COLORS.ruleSoft} },
-          y:{ ticks:{ font:{size:11} }, grid:{display:false} }
+          x:{
+            ticks:{
+              callback:v => fmtNumber(v),
+              font:{family:"'IBM Plex Mono'",size:10}
+            },
+            grid:{color: COLORS.ruleSoft}
+          },
+          y:{
+            ticks:{font:{size:11}},
+            grid:{display:false}
+          }
         }
       }
     });
   }
 
+
   // ---------- table ----------
   function tableColumns(){
-    const cols = [{ key:'date', label:'Fecha' }, { key:'product', label:'Producto' }];
-    if(CONFIG.columnMap.category >= 0) cols.push({ key:'category', label:'Categoría' });
-    if(CONFIG.columnMap.qty >= 0) cols.push({ key:'qty', label:'Cantidad', num:true });
-    cols.push({ key:'amount', label:'Monto', num:true });
-    return cols;
+    return [
+      { key:'date', label:'Fecha / hora' },
+      { key:'table', label:'Mesa' },
+      { key:'client', label:'Cliente' },
+      { key:'category', label:'Categoría' },
+      { key:'order', label:'Pedido' },
+      { key:'qty', label:'Unidades', num:true },
+      { key:'amount', label:'Total', num:true }
+    ];
+  }
+
+  function formatOrderHTML(items){
+    return items.map(item =>
+      `<span class="order-item">
+        <strong>${fmtNumber(item.qty)}×</strong>
+        <span>${escapeHtml(item.product)}</span>
+      </span>`
+    ).join('');
+  }
+
+  function escapeHtml(value){
+    return String(value ?? '').replace(/[&<>"']/g, ch => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'
+    }[ch]));
   }
 
   function renderTableHead(){
     const cols = tableColumns();
     const tr = document.getElementById('tableHeadRow');
     tr.innerHTML = '';
+
     cols.forEach(col => {
       const th = document.createElement('th');
       if(col.num) th.classList.add('num');
       th.dataset.key = col.key;
-      th.innerHTML = col.label + (sortState.key === col.key ? `<span class="arrow">${sortState.dir === 'asc' ? '▲' : '▼'}</span>` : '');
+      th.innerHTML = col.label +
+        (sortState.key === col.key
+          ? `<span class="arrow">${sortState.dir === 'asc' ? '▲' : '▼'}</span>`
+          : '');
+
       th.addEventListener('click', () => {
-        sortState.dir = (sortState.key === col.key && sortState.dir === 'desc') ? 'asc' : 'desc';
+        sortState.dir =
+          (sortState.key === col.key && sortState.dir === 'desc')
+            ? 'asc' : 'desc';
         sortState.key = col.key;
         renderTable();
       });
+
       tr.appendChild(th);
     });
   }
 
   function renderTable(){
     renderTableHead();
-    const cols = tableColumns();
+
     const sorted = [...FILTERED].sort((a,b) => {
-      let av = a[sortState.key], bv = b[sortState.key];
-      if(sortState.key === 'date'){ av = av.getTime(); bv = bv.getTime(); }
-      if(typeof av === 'string') av = av.toLowerCase();
-      if(typeof bv === 'string') bv = bv.toLowerCase();
+      let av, bv;
+
+      if(sortState.key === 'date'){
+        av = a.date.getTime();
+        bv = b.date.getTime();
+      }else if(sortState.key === 'order'){
+        av = a.productText.toLowerCase();
+        bv = b.productText.toLowerCase();
+      }else{
+        av = a[sortState.key];
+        bv = b[sortState.key];
+        if(typeof av === 'string') av = av.toLowerCase();
+        if(typeof bv === 'string') bv = bv.toLowerCase();
+      }
+
       if(av == null) av = '';
       if(bv == null) bv = '';
+
       if(av < bv) return sortState.dir === 'asc' ? -1 : 1;
       if(av > bv) return sortState.dir === 'asc' ? 1 : -1;
       return 0;
     });
+
     const CAP = 500;
     const shown = sorted.slice(0, CAP);
     const tbody = document.getElementById('tableBody');
     const emptyNote = document.getElementById('tableEmpty');
     tbody.innerHTML = '';
-    if(!shown.length){ emptyNote.classList.remove('hidden'); }
-    else { emptyNote.classList.add('hidden'); }
+
+    emptyNote.classList.toggle('hidden', shown.length > 0);
 
     shown.forEach(r => {
       const tr = document.createElement('tr');
-      cols.forEach(col => {
-        const td = document.createElement('td');
-        if(col.num) td.classList.add('num');
-        let v = r[col.key];
-        if(col.key === 'date') v = fmtDate(v);
-        else if(col.key === 'amount') v = fmtMoney(v);
-        else if(col.key === 'qty') v = v == null ? '—' : fmtNumber(v);
-        else v = v == null || v === '' ? '—' : v;
-        td.textContent = v;
-        tr.appendChild(td);
-      });
+
+      tr.innerHTML = `
+        <td>
+          <div class="date-main">${escapeHtml(
+            r.date.toLocaleDateString('es-GT', {
+              day:'2-digit', month:'2-digit', year:'numeric'
+            })
+          )}</div>
+          <div class="date-time">${escapeHtml(
+            r.date.toLocaleTimeString('es-GT', {
+              hour:'2-digit', minute:'2-digit'
+            })
+          )}</div>
+        </td>
+        <td><span class="table-badge">Mesa ${escapeHtml(r.table)}</span></td>
+        <td>
+          <div class="client-name">${escapeHtml(r.client)}</div>
+        </td>
+        <td><span class="category-badge">${escapeHtml(r.category)}</span></td>
+        <td class="order-cell">${formatOrderHTML(r.items)}</td>
+        <td class="num">${fmtNumber(r.qty)}</td>
+        <td class="num total-cell">${fmtMoney(r.amount)}</td>
+      `;
+
       tbody.appendChild(tr);
     });
 
     const countLabel = sorted.length > CAP
-      ? `Mostrando ${fmtNumber(CAP)} de ${fmtNumber(sorted.length)} registros`
-      : `${fmtNumber(sorted.length)} registro${sorted.length===1?'':'s'}`;
+      ? `Mostrando ${fmtNumber(CAP)} de ${fmtNumber(sorted.length)} pedidos`
+      : `${fmtNumber(sorted.length)} pedido${sorted.length===1?'':'s'}`;
+
     document.getElementById('tableCount').textContent = countLabel;
   }
+
 
   function renderAll(){
     renderKPIs();
@@ -1011,7 +1295,7 @@
       const missing = ['date','product','amount'].filter(k => CONFIG.columnMap[k] === -1);
       document.getElementById('mappingBar').classList.toggle('show', missing.length > 0);
       if(missing.length){
-        showError('mappingError', 'No se pudieron detectar automáticamente todas las columnas necesarias. Completá el mapeo y hacé clic en "Aplicar cambios".');
+        showError('mappingError', 'No se pudieron detectar automáticamente Fecha/Hora, Pedido y Total. Completá el mapeo y hacé clic en "Aplicar cambios".');
       } else {
         finalizeData();
       }
@@ -1027,10 +1311,10 @@
     clearError('mappingError');
     const skipped = normalizeRows();
     if(skipped > 0){
-      showError('mappingError', `Se omitieron ${skipped} fila(s) por no tener fecha, producto o monto válidos.`);
+      showError('mappingError', `Se omitieron ${skipped} fila(s) por no tener fecha/hora, un pedido válido o un total válido.`);
     }
     if(!ALL.length){
-      showError('mappingError', 'No quedaron filas válidas con este mapeo. Revisá que las columnas elegidas sean las correctas.');
+      showError('mappingError', 'No quedaron pedidos válidos con este mapeo. Revisá que las columnas Fecha/Hora, Pedido y Total sean las correctas.');
       return;
     }
     setPreset('all');
