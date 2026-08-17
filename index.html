@@ -7,7 +7,31 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Public+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script>
+(function(){
+  function loadChart(src, fallback){
+    var s=document.createElement("script");
+    s.src=src;
+    s.onload=function(){ window.__chartReady=true; };
+    s.onerror=function(){
+      if(fallback){
+        var f=document.createElement("script");
+        f.src=fallback;
+        f.onload=function(){ window.__chartReady=true; };
+        f.onerror=function(){ window.__chartReady=false; };
+        document.head.appendChild(f);
+      }else{
+        window.__chartReady=false;
+      }
+    };
+    document.head.appendChild(s);
+  }
+  loadChart(
+    "https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js",
+    "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"
+  );
+})();
+</script>
 <style>
   :root{
     --paper:#EEF2EA;
@@ -176,8 +200,26 @@
     margin:0 0 14px; font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--ink-soft);
     display:flex; justify-content:space-between; align-items:center;
   }
-  .chart-canvas-wrap{position:relative; height:260px;}
+  .chart-canvas-wrap{position:relative; height:330px; min-height:330px; width:100%; overflow:hidden; padding:4px 0 2px;}
   .charts-row-2{display:grid; grid-template-columns:1.1fr 1fr; gap:20px;}
+  .chart-canvas-wrap svg{font-family:'Public Sans',sans-serif;}
+  .chart-canvas-wrap .chart-tip{
+    position:absolute; pointer-events:none; z-index:5;
+    background:#1C2B22; color:#fff; border-radius:5px;
+    padding:8px 10px; font-size:11px; line-height:1.45;
+    box-shadow:0 5px 18px rgba(28,43,34,.18);
+    opacity:0; transform:translateY(4px);
+    transition:opacity .12s ease,transform .12s ease;
+    white-space:nowrap;
+  }
+  .chart-canvas-wrap .chart-tip.show{opacity:1;transform:translateY(0);}
+  .chart-canvas-wrap .chart-tip strong{font-family:'IBM Plex Mono',monospace;font-size:12px;}
+  .chart-canvas-wrap .chart-hover{cursor:pointer;}
+  .chart-canvas-wrap .chart-hover:hover{opacity:.82;}
+  .chart-canvas-wrap .chart-dot{transition:r .12s ease;}
+  .chart-canvas-wrap .chart-dot:hover{r:6;}
+  .chart-legend-note{font-size:11px;color:var(--ink-soft);font-family:'IBM Plex Mono',monospace;margin-top:4px;}
+
   @media(max-width:760px){.charts-row-2{grid-template-columns:1fr;}}
   .empty-note{color:var(--ink-soft); font-size:13.5px; text-align:center; padding:40px 10px;}
 
@@ -373,7 +415,7 @@
 
   <footer>
     Los datos se leen desde Google Sheets y se procesan en el navegador — no se almacenan en este dashboard.<br>
-    Tip: usá "🔗 Copiar enlace directo" en Ajustes para volver sin tener que pegar el link de nuevo.
+    Tip: usá "🔗 Copiar enlace directo" en Ajustes para volver sin tener que pegar el link de nuevo.<br>Si una gráfica no carga, el dashboard mostrará el motivo directamente sobre la gráfica.
   </footer>
 </div>
 
@@ -383,6 +425,35 @@
 
   const COLORS = { green:'#2F6F4E', greenDeep:'#1F4D36', red:'#A63A2E', gold:'#C9932B', ink:'#1C2B22', inkSoft:'#54655A', ruleSoft:'#DAE3D5', white:'#FBFCF9' };
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function chartError(message){
+    const ids = ['trendChart','groupChart','topChart'];
+    ids.forEach(id=>{
+      const canvas = document.getElementById(id);
+      if(!canvas) return;
+      const wrap = canvas.parentElement;
+      let box = wrap.querySelector('.chart-error');
+      if(!box){
+        box = document.createElement('div');
+        box.className = 'chart-error';
+        box.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:20px;color:#A63A2E;font-size:13px;background:rgba(251,252,249,.92);z-index:3;';
+        wrap.appendChild(box);
+      }
+      box.textContent = message;
+    });
+  }
+
+  function clearChartErrors(){
+    document.querySelectorAll('.chart-error').forEach(el=>el.remove());
+  }
+
+  function ensureChartJs(){
+    if(typeof Chart === 'undefined'){
+      chartError('No se pudo cargar Chart.js. Verificá tu conexión a internet o alojá también Chart.js localmente.');
+      return false;
+    }
+    return true;
+  }
+
 
   let CONFIG = {
     sheetId:null,
@@ -551,22 +622,21 @@
 
   // ---------- fetch & parse ----------
   async function fetchSheet(id, tabName){
-    const url = buildGvizUrl(id, tabName);
+    const jsonUrl = buildGvizUrl(id, tabName);
+    const csvUrl = buildCsvUrl(id, tabName);
 
-    // Primero intentamos Gviz JSON. Esto funciona cuando la hoja permite lectura
-    // desde el navegador y nos da tipos de datos útiles para fechas/números.
+    async function request(url){
+      const res = await fetch(url, {method:'GET', mode:'cors', cache:'no-store'});
+      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.text();
+    }
+
+    let text = '';
+    let jsonError = null;
+
+    // Primero GViz JSON: conserva tipos de fecha/número cuando Google los entrega.
     try{
-      const res = await fetch(url, {
-        method:'GET',
-        mode:'cors',
-        cache:'no-store'
-      });
-
-      if(!res.ok){
-        throw new Error(`HTTP ${res.status}`);
-      }
-
-      const text = await res.text();
+      text = await request(jsonUrl);
       const data = parseGvizResponse(text);
 
       if(data){
@@ -596,32 +666,51 @@
           throw new Error('La hoja está vacía o no tiene filas debajo del encabezado.');
         }
 
-        return { headers, rows };
+        return {headers, rows};
       }
 
-      // Algunas respuestas no tienen el wrapper esperado. Si llegamos aquí,
-      // damos un mensaje útil en lugar del error genérico.
       if(/Sign in|Iniciar sesión|Access denied|Permission denied/i.test(text)){
         throw new Error('Google Sheets está solicitando acceso. Verificá que la hoja esté compartida como "Cualquiera con el enlace → Lector".');
       }
 
-      throw new Error('Google no devolvió datos de la hoja en el formato esperado.');
+      jsonError = new Error('Google no devolvió datos GViz en el formato esperado.');
     }catch(e){
-      const message = String(e && e.message || e);
+      jsonError = e;
+    }
 
-      // Los errores de CORS suelen aparecer como "Failed to fetch".
-      if(/Failed to fetch|NetworkError|CORS|Load failed/i.test(message)){
-        throw new Error(
-          'El navegador bloqueó la conexión directa con Google Sheets. ' +
-          'Si abrís este HTML como archivo local (file://), ejecutalo mediante un servidor local ' +
-          '(por ejemplo VS Code Live Server) o alojalo en una página web. ' +
-          'Además, confirmá que la hoja esté compartida como "Cualquiera con el enlace → Lector".'
-        );
+    // Fallback CSV: útil con hojas que devuelven GViz irregularmente.
+    try{
+      const csvText = await request(csvUrl);
+      if(/Sign in|Iniciar sesión|Access denied|Permission denied/i.test(csvText)){
+        throw new Error('Google Sheets está solicitando acceso. Verificá que la hoja esté compartida como "Cualquiera con el enlace → Lector".');
       }
 
+      const matrix = parseCsv(csvText);
+      if(!matrix.length || !matrix[0].length){
+        throw new Error('La hoja no devolvió datos.');
+      }
+
+      const headers = matrix[0].map((h,i)=>String(h || '').trim() || ('Columna ' + (i+1)));
+      const rows = matrix.slice(1).map(row=>{
+        const out = [];
+        for(let i=0;i<headers.length;i++) out.push(row[i] ?? null);
+        return out;
+      }).filter(row=>row.some(v=>String(v ?? '').trim() !== ''));
+
+      if(!rows.length) throw new Error('La hoja está vacía o no tiene filas debajo del encabezado.');
+      return {headers, rows};
+    }catch(csvError){
+      const msg = String((csvError && csvError.message) || csvError || jsonError || '');
+      if(/Failed to fetch|NetworkError|CORS|Load failed/i.test(msg)){
+        throw new Error(
+          'El navegador bloqueó la conexión con Google Sheets. Si abrís este HTML como file://, usá Live Server, GitHub Pages, Netlify o Vercel. Además, verificá "Cualquiera con el enlace → Lector".'
+        );
+      }
       throw new Error(
-        'No se pudo leer Google Sheets: ' + message +
-        ' Verificá que el ID/link sea correcto y que la hoja tenga acceso de lectura.'
+        'No se pudo leer Google Sheets. ' +
+        String((jsonError && jsonError.message) || '') +
+        ' ' + msg +
+        ' Verificá el ID/link, la pestaña y los permisos de lectura.'
       );
     }
   }
@@ -962,173 +1051,210 @@
   }
 
   // ---------- charts ----------
-  function destroyChart(key){ if(charts[key]){ charts[key].destroy(); charts[key] = null; } }
+  // Gráficas SVG profesionales: sin dependencia externa, con hover/tooltips.
+
+  function destroyChart(key){ charts[key] = null; }
+
+  function svgEsc(v){
+    return String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function chartBox(id){
+    const canvas=document.getElementById(id);
+    const wrap=canvas?.parentElement;
+    if(!wrap) return null;
+    canvas.style.display='none';
+    let svg=wrap.querySelector('svg[data-chart="'+id+'"]');
+    if(!svg){
+      svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+      svg.setAttribute('data-chart',id);
+      svg.setAttribute('viewBox','0 0 1000 330');
+      svg.setAttribute('preserveAspectRatio','none');
+      svg.style.cssText='display:block;width:100%;height:100%;overflow:visible;';
+      wrap.appendChild(svg);
+    }
+    let tip=wrap.querySelector('.chart-tip');
+    if(!tip){
+      tip=document.createElement('div');
+      tip.className='chart-tip';
+      wrap.appendChild(tip);
+    }
+    return {svg,wrap,tip};
+  }
+
+  function niceMax(value){
+    if(!isFinite(value)||value<=0)return 1;
+    const p=Math.pow(10,Math.floor(Math.log10(value)));
+    return Math.ceil(value/p)*p;
+  }
+
+  function money(v){
+    return CONFIG.currency+' '+fmtNumber(v);
+  }
+
+  function addTipBehavior(el,tip,wrap,title,value){
+    el.addEventListener('mouseenter',e=>{
+      tip.innerHTML='<strong>'+svgEsc(title)+'</strong><br>'+svgEsc(value);
+      const r=wrap.getBoundingClientRect();
+      const er=e.clientX-r.left, ey=e.clientY-r.top;
+      tip.style.left=Math.max(8,Math.min(er+12,r.width-170))+'px';
+      tip.style.top=Math.max(8,ey-45)+'px';
+      tip.classList.add('show');
+    });
+    el.addEventListener('mousemove',e=>{
+      const r=wrap.getBoundingClientRect();
+      tip.style.left=Math.max(8,Math.min(e.clientX-r.left+12,r.width-170))+'px';
+      tip.style.top=Math.max(8,e.clientY-r.top-45)+'px';
+    });
+    el.addEventListener('mouseleave',()=>tip.classList.remove('show'));
+  }
 
   function renderTrendChart(){
-    const wrap = document.getElementById('trendChart').parentElement;
-    const emptyNote = document.getElementById('trendEmpty');
-    destroyChart('trend');
-    if(!FILTERED.length){ wrap.classList.add('hidden'); emptyNote.classList.remove('hidden'); return; }
-    wrap.classList.remove('hidden'); emptyNote.classList.add('hidden');
+    const empty=document.getElementById('trendEmpty');
+    const box=chartBox('trendChart');
+    if(!box)return;
+    const {svg,wrap,tip}=box;
+    svg.innerHTML='';
+    tip.classList.remove('show');
 
-    const dates = FILTERED.map(r => r.date);
-    const spanDays = (Math.max(...dates) - Math.min(...dates)) / 86400000;
-    const byMonth = spanDays > 60;
-    const sorted = [...FILTERED].sort((a,b) => a.date - b.date);
-    const map = new Map();
-    sorted.forEach(r => {
-      const key = byMonth ? r.date.getFullYear()+'-'+r.date.getMonth() : r.date.toDateString();
-      if(!map.has(key)) map.set(key, { label: bucketLabel(r.date, byMonth), total:0, sortKey:r.date });
-      map.get(key).total += r.amount;
+    if(!FILTERED.length){
+      wrap.classList.add('hidden'); empty.classList.remove('hidden'); return;
+    }
+    wrap.classList.remove('hidden'); empty.classList.add('hidden');
+
+    const dates=FILTERED.map(r=>r.date).filter(d=>d instanceof Date&&!isNaN(d));
+    if(!dates.length){empty.textContent='No hay fechas válidas para graficar.';empty.classList.remove('hidden');return;}
+
+    const span=(Math.max(...dates)-Math.min(...dates))/86400000;
+    const byMonth=span>60;
+    const map=new Map();
+    [...FILTERED].sort((a,b)=>a.date-b.date).forEach(r=>{
+      if(!(r.date instanceof Date)||isNaN(r.date)||!isFinite(r.amount))return;
+      const k=byMonth?r.date.getFullYear()+'-'+r.date.getMonth():r.date.toDateString();
+      if(!map.has(k))map.set(k,{label:bucketLabel(r.date,byMonth),total:0});
+      map.get(k).total+=Number(r.amount)||0;
     });
-    const points = [...map.values()].sort((a,b) => a.sortKey - b.sortKey);
+    const points=[...map.values()];
+    if(!points.length)return;
 
-    const ctx = document.getElementById('trendChart').getContext('2d');
-    const gradient = ctx.createLinearGradient(0,0,0,240);
-    gradient.addColorStop(0, 'rgba(47,111,78,0.28)');
-    gradient.addColorStop(1, 'rgba(47,111,78,0.02)');
+    const W=1000,H=330,L=76,R=28,T=28,B=58,pw=W-L-R,ph=H-T-B;
+    const maxY=niceMax(Math.max(...points.map(p=>p.total)));
+    const x=i=>L+(points.length===1?pw/2:i*pw/(points.length-1));
+    const y=v=>T+ph-v/maxY*ph;
+    let s='';
 
-    charts.trend = new Chart(ctx, {
-      type:'line',
-      data:{ labels: points.map(p=>p.label), datasets:[{
-        data: points.map(p=>p.total), borderColor: COLORS.green, backgroundColor: gradient,
-        fill:true, tension:0.3, pointRadius:3, pointBackgroundColor: COLORS.greenDeep, borderWidth:2
-      }]},
-      options:{
-        responsive:true, maintainAspectRatio:false,
-        plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label: c => fmtMoney(c.parsed.y) } } },
-        scales:{
-          y:{ ticks:{ callback:v => CONFIG.currency+' '+fmtNumber(v), font:{family:"'IBM Plex Mono'",size:10} }, grid:{color: COLORS.ruleSoft} },
-          x:{ ticks:{ font:{family:"'IBM Plex Mono'",size:10} }, grid:{display:false} }
-        }
-      }
+    // Grid
+    for(let i=0;i<=5;i++){
+      const val=maxY*i/5,yy=y(val);
+      s+=`<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="#E3E8E0" stroke-width="1"/>`;
+      s+=`<text x="${L-12}" y="${yy+4}" text-anchor="end" font-family="IBM Plex Mono" font-size="10" fill="#718077">${svgEsc(money(val))}</text>`;
+    }
+
+    const coords=points.map((p,i)=>[x(i),y(p.total)]);
+    const line=coords.map(p=>p.join(',')).join(' ');
+    const area=`${L},${T+ph} ${line} ${W-R},${T+ph}`;
+    s+=`<polygon points="${area}" fill="#E7F0E8"/>`;
+    s+=`<polyline points="${line}" fill="none" stroke="#2F6F4E" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>`;
+
+    points.forEach((p,i)=>{
+      const [xx,yy]=coords[i];
+      const circle=document.createElementNS('http://www.w3.org/2000/svg','circle');
+      circle.setAttribute('cx',xx);circle.setAttribute('cy',yy);circle.setAttribute('r',i===points.length-1?'5':'4');
+      circle.setAttribute('fill','#2F6F4E');circle.setAttribute('stroke','#fff');circle.setAttribute('stroke-width','2');
+      circle.setAttribute('class','chart-hover');
+      circle.addEventListener('mouseenter',e=>{
+        tip.innerHTML='<strong>'+svgEsc(p.label)+'</strong><br>'+svgEsc(money(p.total));
+        const r=wrap.getBoundingClientRect();
+        tip.style.left=Math.max(8,Math.min(xx/r.width*1000/r.width*r.width+12,r.width-170))+'px';
+        tip.style.left=Math.max(8,Math.min(xx*(r.width/1000)+12,r.width-170))+'px';
+        tip.style.top=Math.max(8,yy*(r.height/330)-42)+'px';
+        tip.classList.add('show');
+      });
+      circle.addEventListener('mouseleave',()=>tip.classList.remove('show'));
+      svg.appendChild(circle);
+    });
+
+    svg.insertAdjacentHTML('afterbegin',s);
+
+    const labelStep=points.length>14?Math.ceil(points.length/8):1;
+    points.forEach((p,i)=>{
+      if(i%labelStep!==0&&i!==points.length-1)return;
+      svg.insertAdjacentHTML('beforeend',
+        `<text x="${x(i)}" y="${H-20}" text-anchor="middle" font-family="IBM Plex Mono" font-size="10" fill="#718077">${svgEsc(p.label)}</text>`);
     });
   }
 
   function renderGroupChart(){
-    const wrap = document.getElementById('groupChart').parentElement;
-    const emptyNote = document.getElementById('groupEmpty');
-    const title = document.getElementById('groupChartTitle');
-    destroyChart('group');
+    const empty=document.getElementById('groupEmpty');
+    const box=chartBox('groupChart');
+    if(!box)return;
+    const {svg,wrap,tip}=box;
+    svg.innerHTML='';tip.classList.remove('show');
+    if(!FILTERED.length){wrap.classList.add('hidden');empty.classList.remove('hidden');return;}
+    wrap.classList.remove('hidden');empty.classList.add('hidden');
 
-    if(!FILTERED.length){
-      wrap.classList.add('hidden');
-      emptyNote.classList.remove('hidden');
-      return;
+    const map=groupSum(FILTERED,r=>r.category||'Sin categoría',r=>r.amount);
+    const entries=[...map.entries()].sort((a,b)=>b[1]-a[1]).slice(0,8);
+    if(!entries.length)return;
+
+    const W=1000,H=330,L=68,R=24,T=28,B=62,pw=W-L-R,ph=H-T-B,gap=pw/entries.length,bw=Math.min(68,gap*.58);
+    const maxY=niceMax(Math.max(...entries.map(e=>e[1])));
+    let s='';
+    for(let i=0;i<=5;i++){
+      const v=maxY*i/5,yy=T+ph-v/maxY*ph;
+      s+=`<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="#E3E8E0"/>`;
+      s+=`<text x="${L-10}" y="${yy+4}" text-anchor="end" font-family="IBM Plex Mono" font-size="10" fill="#718077">${svgEsc(money(v))}</text>`;
     }
 
-    wrap.classList.remove('hidden');
-    emptyNote.classList.add('hidden');
+    entries.forEach((e,i)=>{
+      const xx=L+i*gap+(gap-bw)/2,bh=e[1]/maxY*ph,yy=T+ph-bh;
+      s+=`<rect class="chart-hover" data-i="${i}" x="${xx}" y="${yy}" width="${bw}" height="${Math.max(2,bh)}" rx="5" fill="#2F6F4E"/>`;
+      s+=`<text x="${xx+bw/2}" y="${yy-8}" text-anchor="middle" font-family="IBM Plex Mono" font-size="10" font-weight="600" fill="#36433B">${svgEsc(fmtNumber(e[1]))}</text>`;
+      s+=`<text x="${xx+bw/2}" y="${H-20}" text-anchor="middle" font-family="Public Sans" font-size="10" fill="#718077">${svgEsc(String(e[0]).slice(0,15))}</text>`;
+    });
+    svg.innerHTML=s;
 
-    title.textContent = 'Ventas por categoría';
-
-    const map = groupSum(
-      FILTERED,
-      r => r.category || 'Sin categoría',
-      r => r.amount
-    );
-
-    const entries = [...map.entries()].sort((a,b) => b[1]-a[1]).slice(0,10);
-    const ctx = document.getElementById('groupChart').getContext('2d');
-
-    charts.group = new Chart(ctx, {
-      type:'bar',
-      data:{
-        labels: entries.map(e=>e[0]),
-        datasets:[{
-          data: entries.map(e=>e[1]),
-          backgroundColor: COLORS.green,
-          hoverBackgroundColor: COLORS.gold,
-          borderRadius:2,
-          maxBarThickness:38
-        }]
-      },
-      options:{
-        responsive:true,
-        maintainAspectRatio:false,
-        plugins:{
-          legend:{display:false},
-          tooltip:{ callbacks:{ label: c => fmtMoney(c.parsed.y) } }
-        },
-        scales:{
-          y:{
-            ticks:{
-              callback:v => CONFIG.currency+' '+fmtNumber(v),
-              font:{family:"'IBM Plex Mono'",size:10}
-            },
-            grid:{color: COLORS.ruleSoft}
-          },
-          x:{
-            ticks:{font:{size:10}},
-            grid:{display:false}
-          }
-        }
-      }
+    svg.querySelectorAll('rect.chart-hover').forEach((bar,i)=>{
+      addTipBehavior(bar,tip,wrap,entries[i][0],money(entries[i][1]));
     });
   }
 
   function renderTopChart(){
-    const wrap = document.getElementById('topChart').parentElement;
-    const emptyNote = document.getElementById('topEmpty');
-    destroyChart('top');
+    const empty=document.getElementById('topEmpty');
+    const box=chartBox('topChart');
+    if(!box)return;
+    const {svg,wrap,tip}=box;
+    svg.innerHTML='';tip.classList.remove('show');
+    if(!PRODUCT_LINES.length){wrap.classList.add('hidden');empty.classList.remove('hidden');return;}
+    wrap.classList.remove('hidden');empty.classList.add('hidden');
 
-    if(!PRODUCT_LINES.length){
-      wrap.classList.add('hidden');
-      emptyNote.classList.remove('hidden');
-      return;
-    }
+    const map=productUnitsMap();
+    const entries=[...map.entries()].sort((a,b)=>b[1]-a[1]).slice(0,7);
+    if(!entries.length)return;
 
-    wrap.classList.remove('hidden');
-    emptyNote.classList.add('hidden');
+    const W=1000,H=330,L=235,R=50,T=28,B=24,pw=W-L-R,rowH=(H-T-B)/entries.length;
+    const maxX=Math.max(1,...entries.map(e=>e[1]));
+    let s='';
 
-    const map = productUnitsMap();
-    const entries = [...map.entries()]
-      .sort((a,b) => a[1]-b[1])
-      .slice(-7);
+    // vertical guide
+    [0,.25,.5,.75,1].forEach(q=>{
+      const xx=L+pw*q;
+      s+=`<line x1="${xx}" y1="${T}" x2="${xx}" y2="${H-B}" stroke="#E3E8E0"/>`;
+    });
 
-    const ctx = document.getElementById('topChart').getContext('2d');
+    entries.forEach((e,i)=>{
+      const yy=T+i*rowH+rowH*.18,bh=rowH*.64,ww=e[1]/maxX*pw;
+      s+=`<rect class="chart-hover" data-i="${i}" x="${L}" y="${yy}" width="${Math.max(3,ww)}" height="${bh}" rx="6" fill="#B48A36"/>`;
+      s+=`<text x="${L-14}" y="${yy+bh*.67}" text-anchor="end" font-family="Public Sans" font-size="11" font-weight="${i===0?'700':'500'}" fill="#36433B">${svgEsc(String(e[0]).slice(0,32))}</text>`;
+      s+=`<text x="${Math.min(W-R,L+ww+9)}" y="${yy+bh*.67}" font-family="IBM Plex Mono" font-size="11" font-weight="600" fill="#647168">${svgEsc(fmtNumber(e[1]))}</text>`;
+    });
 
-    charts.top = new Chart(ctx, {
-      type:'bar',
-      data:{
-        labels: entries.map(e=>e[0]),
-        datasets:[{
-          data: entries.map(e=>e[1]),
-          backgroundColor: COLORS.gold,
-          hoverBackgroundColor: COLORS.greenDeep,
-          borderRadius:2,
-          maxBarThickness:28
-        }]
-      },
-      options:{
-        indexAxis:'y',
-        responsive:true,
-        maintainAspectRatio:false,
-        plugins:{
-          legend:{display:false},
-          tooltip:{
-            callbacks:{
-              label: c => `${fmtNumber(c.parsed.x)} unidades`
-            }
-          }
-        },
-        scales:{
-          x:{
-            ticks:{
-              callback:v => fmtNumber(v),
-              font:{family:"'IBM Plex Mono'",size:10}
-            },
-            grid:{color: COLORS.ruleSoft}
-          },
-          y:{
-            ticks:{font:{size:11}},
-            grid:{display:false}
-          }
-        }
-      }
+    svg.innerHTML=s;
+    svg.querySelectorAll('rect.chart-hover').forEach((bar,i)=>{
+      addTipBehavior(bar,tip,wrap,entries[i][0],fmtNumber(entries[i][1])+' unidades');
     });
   }
-
 
   // ---------- table ----------
   function tableColumns(){
